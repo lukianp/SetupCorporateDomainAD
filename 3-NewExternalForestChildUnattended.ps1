@@ -821,6 +821,61 @@ function Install-ExternalForestDC {
         Start-Sleep -Seconds 15
     }
     
+    # CRITICAL: Verify and create DNS zones if missing
+    # Sometimes Install-ADDSForest doesn't properly create AD-integrated DNS zones
+    Write-Log "Verifying DNS zones..."
+    Invoke-Command -VMName $Config.VMName -Credential $domainCred -ScriptBlock {
+        param($DomainName, $SelfIP)
+        
+        Import-Module DnsServer -ErrorAction SilentlyContinue
+        
+        # Check if primary zone exists
+        $primaryZone = Get-DnsServerZone -Name $DomainName -ErrorAction SilentlyContinue
+        if (-not $primaryZone) {
+            Write-Host "  WARNING: Primary DNS zone missing - creating..." -ForegroundColor Yellow
+            Add-DnsServerPrimaryZone -Name $DomainName -ReplicationScope Domain -DynamicUpdate Secure -ErrorAction Stop
+            Write-Host "  Created primary zone: $DomainName" -ForegroundColor Green
+        } else {
+            Write-Host "  Primary zone exists: $DomainName" -ForegroundColor Green
+        }
+        
+        # Check if _msdcs zone exists (critical for DC GUID resolution)
+        $msdcsZone = "_msdcs.$DomainName"
+        $msdcsExists = Get-DnsServerZone -Name $msdcsZone -ErrorAction SilentlyContinue
+        if (-not $msdcsExists) {
+            Write-Host "  WARNING: _msdcs zone missing - creating..." -ForegroundColor Yellow
+            Add-DnsServerPrimaryZone -Name $msdcsZone -ReplicationScope Forest -DynamicUpdate Secure -ErrorAction Stop
+            Write-Host "  Created _msdcs zone: $msdcsZone" -ForegroundColor Green
+        } else {
+            Write-Host "  _msdcs zone exists: $msdcsZone" -ForegroundColor Green
+        }
+        
+        # Ensure DNS client points to self
+        $adapter = Get-NetAdapter | Where-Object Status -eq "Up" | Select-Object -First 1
+        Set-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -ServerAddresses @($SelfIP)
+        
+        # Clear caches and force re-registration
+        Clear-DnsClientCache
+        Clear-DnsServerCache -Force -ErrorAction SilentlyContinue
+        
+        # Register DC records
+        ipconfig /registerdns | Out-Null
+        Start-Sleep -Seconds 5
+        nltest /dsregdns 2>&1 | Out-Null
+        
+        # Verify zones are queryable
+        Start-Sleep -Seconds 5
+        $testResolve = Resolve-DnsName -Name $DomainName -Type A -DnsOnly -ErrorAction SilentlyContinue
+        if ($testResolve) {
+            Write-Host "  DNS verification: $DomainName resolves correctly" -ForegroundColor Green
+        } else {
+            Write-Host "  DNS verification: May need additional time to propagate" -ForegroundColor Yellow
+        }
+        
+    } -ArgumentList $Config.ExternalDomain, $Config.VMIP
+    
+    Write-Log "DNS zones verified" -Level Success
+    
     # Configure DNS conditional forwarders for cross-forest resolution
     if ($Config.CreateTrust) {
         Write-Log "Configuring DNS for cross-forest resolution..."
