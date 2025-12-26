@@ -138,7 +138,7 @@ function Get-UserConfiguration {
     Write-Host "════════════════════════════════════════════════════════════════" -ForegroundColor Cyan
     Write-Host "  CONFIGURATION SUMMARY" -ForegroundColor Cyan
     Write-Host "════════════════════════════════════════════════════════════════" -ForegroundColor Cyan
-    Write-Host "  Parent Domain:     $parentDomain (DC: $parentDCIP)"
+    Write-Host "  Parent Domain:     $parentDomain (DC: $parentDCIP, VM: $parentVMName)"
     Write-Host "  Child Domain:      $childDomain ($childNetBIOS)"
     Write-Host "  VM Name:           $vmName"
     Write-Host "  Specs:             ${vmMemory}GB RAM, $vmCPU vCPUs, ${vmDisk}GB Disk"
@@ -160,6 +160,7 @@ function Get-UserConfiguration {
         # Parent Domain
         ParentDomain       = $parentDomain
         ParentDCIP         = $parentDCIP
+        ParentVMName       = $parentVMName
         ParentAdminPassword = $parentAdminPassword
         ParentNetBIOS      = ($parentDomain -split '\.')[0].ToUpper()
         
@@ -194,6 +195,7 @@ function Get-DefaultConfiguration {
     return @{
         ParentDomain       = "ljpops.com"
         ParentDCIP         = "192.168.0.10"
+        ParentVMName       = "uran"
         ParentAdminPassword = "LabAdmin2025!"
         ParentNetBIOS      = "LJPOPS"
         ChildDomain        = "corp.ljpops.com"
@@ -971,6 +973,62 @@ function Install-ChildDomainController {
     Write-Log "Child Domain Controller configured" -Level Success
 }
 
+function Configure-ParentDCDNS {
+    Write-Log "Configuring DNS forwarders on parent DC ($($Config.ParentVMName))..."
+    
+    $securePassword = ConvertTo-SecureString $Config.ParentAdminPassword -AsPlainText -Force
+    $parentCred = New-Object PSCredential("$($Config.ParentNetBIOS)\Administrator", $securePassword)
+    
+    try {
+        Invoke-Command -VMName $Config.ParentVMName -Credential $parentCred -ScriptBlock {
+            param($ChildDomain, $ChildDCIP)
+            
+            Import-Module DnsServer -ErrorAction SilentlyContinue
+            
+            # Add conditional forwarder for child domain
+            $existingForwarder = Get-DnsServerZone -Name $ChildDomain -ErrorAction SilentlyContinue
+            if (-not $existingForwarder) {
+                Add-DnsServerConditionalForwarderZone -Name $ChildDomain -MasterServers $ChildDCIP -ErrorAction SilentlyContinue
+                Write-Host "  Added forwarder on parent: $ChildDomain -> $ChildDCIP" -ForegroundColor Green
+            } else {
+                Write-Host "  Forwarder already exists: $ChildDomain" -ForegroundColor Cyan
+            }
+            
+            # Add _msdcs zone forwarder for child domain (for DC GUID resolution)
+            $msdcsZone = "_msdcs.$ChildDomain"
+            $existingMsdcs = Get-DnsServerZone -Name $msdcsZone -ErrorAction SilentlyContinue
+            if (-not $existingMsdcs) {
+                Add-DnsServerConditionalForwarderZone -Name $msdcsZone -MasterServers $ChildDCIP -ErrorAction SilentlyContinue
+                Write-Host "  Added forwarder on parent: $msdcsZone -> $ChildDCIP" -ForegroundColor Green
+            } else {
+                Write-Host "  Forwarder already exists: $msdcsZone" -ForegroundColor Cyan
+            }
+            
+            # Clear DNS cache
+            Clear-DnsServerCache -Force -ErrorAction SilentlyContinue
+            
+            # Verify resolution
+            Start-Sleep -Seconds 2
+            $testResolution = Resolve-DnsName -Name $ChildDomain -Type A -ErrorAction SilentlyContinue
+            if ($testResolution) {
+                Write-Host "  DNS verification: $ChildDomain resolved successfully" -ForegroundColor Green
+            }
+            
+        } -ArgumentList $Config.ChildDomain, $Config.VMIP -ErrorAction Stop
+        
+        Write-Log "DNS forwarders configured on parent DC" -Level Success
+    }
+    catch {
+        Write-Log "Could not configure DNS on parent DC: $_" -Level Warning
+        Write-Log "You may need to manually add conditional forwarders on the parent DC" -Level Warning
+        Write-Host ""
+        Write-Host "  Manual fix on parent DC:" -ForegroundColor Yellow
+        Write-Host "    Add-DnsServerConditionalForwarderZone -Name '$($Config.ChildDomain)' -MasterServers $($Config.VMIP)" -ForegroundColor Cyan
+        Write-Host "    Add-DnsServerConditionalForwarderZone -Name '_msdcs.$($Config.ChildDomain)' -MasterServers $($Config.VMIP)" -ForegroundColor Cyan
+        Write-Host ""
+    }
+}
+
 function Install-PrivilegedAdminAccounts {
     Write-Log "Creating privileged admin accounts in child domain..."
     
@@ -1422,6 +1480,7 @@ try {
     
     Install-ChildDomainController
     Verify-PostDeploymentHealth
+    Configure-ParentDCDNS
     Install-PrivilegedAdminAccounts
     Install-BulkADObjects
     Install-TempShare
