@@ -164,7 +164,7 @@ function Get-UserConfiguration {
     Write-Host "════════════════════════════════════════════════════════════════" -ForegroundColor Magenta
     Write-Host "  CONFIGURATION SUMMARY" -ForegroundColor Magenta
     Write-Host "════════════════════════════════════════════════════════════════" -ForegroundColor Magenta
-    Write-Host "  Primary Forest:    $primaryDomain (DC: $primaryDCIP)"
+    Write-Host "  Primary Forest:    $primaryDomain (DC: $primaryDCIP, VM: $primaryVMName)"
     Write-Host "  External Forest:   $externalDomain ($externalNetBIOS) ← ACQUIRED CO"
     Write-Host "  VM Name:           $vmName"
     Write-Host "  Specs:             ${vmMemory}GB RAM, $vmCPU vCPUs, ${vmDisk}GB Disk"
@@ -187,6 +187,7 @@ function Get-UserConfiguration {
         # Primary Forest (for trust)
         PrimaryDomain       = $primaryDomain
         PrimaryDCIP         = $primaryDCIP
+        PrimaryVMName       = $primaryVMName
         PrimaryAdminPassword = $primaryAdminPassword
         PrimaryNetBIOS      = ($primaryDomain -split '\.')[0].ToUpper()
         
@@ -223,10 +224,11 @@ function Get-DefaultConfiguration {
     return @{
         PrimaryDomain       = "ljpops.com"
         PrimaryDCIP         = "192.168.0.10"
+        PrimaryVMName       = "uran"
         PrimaryAdminPassword = "LabAdmin2025!"
         PrimaryNetBIOS      = "LJPOPS"
-        ExternalDomain      = "yourpc-yourpc.yourpc"
-        ExternalNetBIOS     = "YOURPC"
+        ExternalDomain      = "acquired.local"
+        ExternalNetBIOS     = "ACQUIRED"
         AdminPassword       = "AcqAdmin2025!"
         SafeModePassword    = "AcqAdmin2025!"
         VMName              = "acq-dc01"
@@ -892,9 +894,10 @@ function Install-ForestTrust {
     $primaryCred = New-Object PSCredential("$($Config.PrimaryNetBIOS)\Administrator", $primarySecurePassword)
     
     # First, configure DNS on primary DC to resolve external forest
-    Write-Log "Configuring DNS conditional forwarder on primary DC..."
+    # Using Invoke-Command -VMName for direct Hyper-V connection (avoids WinRM issues)
+    Write-Log "Configuring DNS conditional forwarder on primary DC ($($Config.PrimaryVMName))..."
     try {
-        Invoke-Command -ComputerName $Config.PrimaryDCIP -Credential $primaryCred -ScriptBlock {
+        Invoke-Command -VMName $Config.PrimaryVMName -Credential $primaryCred -ScriptBlock {
             param($ExternalDomain, $ExternalDCIP)
             
             # Add conditional forwarder for external forest
@@ -902,6 +905,8 @@ function Install-ForestTrust {
             if (-not $existingForwarder) {
                 Add-DnsServerConditionalForwarderZone -Name $ExternalDomain -MasterServers $ExternalDCIP -ErrorAction SilentlyContinue
                 Write-Host "  Added forwarder on primary: $ExternalDomain -> $ExternalDCIP" -ForegroundColor Green
+            } else {
+                Write-Host "  Forwarder already exists: $ExternalDomain" -ForegroundColor Cyan
             }
             
             # Add _msdcs zone forwarder for external forest
@@ -910,6 +915,8 @@ function Install-ForestTrust {
             if (-not $existingMsdcs) {
                 Add-DnsServerConditionalForwarderZone -Name $msdcsZone -MasterServers $ExternalDCIP -ErrorAction SilentlyContinue
                 Write-Host "  Added forwarder on primary: $msdcsZone -> $ExternalDCIP" -ForegroundColor Green
+            } else {
+                Write-Host "  Forwarder already exists: $msdcsZone" -ForegroundColor Cyan
             }
             
             Clear-DnsServerCache -Force -ErrorAction SilentlyContinue
