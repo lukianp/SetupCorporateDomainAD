@@ -926,6 +926,53 @@ function Install-ChildDomainController {
         Start-Sleep -Seconds 15
     }
     
+    # CRITICAL: Verify and create DNS zones if missing
+    # Sometimes Install-ADDSDomain doesn't properly create AD-integrated DNS zones
+    Write-Log "Verifying DNS zones..."
+    Invoke-Command -VMName $Config.VMName -Credential $childDomainCred -ScriptBlock {
+        param($ChildDomain, $SelfIP, $ParentDCIP)
+        
+        Import-Module DnsServer -ErrorAction SilentlyContinue
+        
+        # Check if primary zone exists for child domain
+        $primaryZone = Get-DnsServerZone -Name $ChildDomain -ErrorAction SilentlyContinue
+        if (-not $primaryZone) {
+            Write-Host "  WARNING: Primary DNS zone missing - creating..." -ForegroundColor Yellow
+            Add-DnsServerPrimaryZone -Name $ChildDomain -ReplicationScope Domain -DynamicUpdate Secure -ErrorAction Stop
+            Write-Host "  Created primary zone: $ChildDomain" -ForegroundColor Green
+        } else {
+            Write-Host "  Primary zone exists: $ChildDomain" -ForegroundColor Green
+        }
+        
+        # For child domain, _msdcs records go in parent's _msdcs zone via delegation
+        # But we should have our own DomainDnsZones
+        
+        # Ensure DNS client points to self first, then parent
+        $adapter = Get-NetAdapter | Where-Object Status -eq "Up" | Select-Object -First 1
+        Set-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -ServerAddresses @($SelfIP, $ParentDCIP)
+        
+        # Clear caches and force re-registration
+        Clear-DnsClientCache
+        Clear-DnsServerCache -Force -ErrorAction SilentlyContinue
+        
+        # Register DC records
+        ipconfig /registerdns | Out-Null
+        Start-Sleep -Seconds 5
+        nltest /dsregdns 2>&1 | Out-Null
+        
+        # Verify zone is queryable
+        Start-Sleep -Seconds 5
+        $testResolve = Resolve-DnsName -Name $ChildDomain -Type A -DnsOnly -ErrorAction SilentlyContinue
+        if ($testResolve) {
+            Write-Host "  DNS verification: $ChildDomain resolves correctly" -ForegroundColor Green
+        } else {
+            Write-Host "  DNS verification: May need additional time to propagate" -ForegroundColor Yellow
+        }
+        
+    } -ArgumentList $Config.ChildDomain, $Config.VMIP, $Config.ParentDCIP
+    
+    Write-Log "DNS zones verified" -Level Success
+    
     # Update DNS configuration - CRITICAL for cross-domain resolution
     Write-Log "Updating DNS configuration..."
     Invoke-Command -VMName $Config.VMName -Credential $childDomainCred -ScriptBlock {
