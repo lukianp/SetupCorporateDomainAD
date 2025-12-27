@@ -65,17 +65,39 @@ function Get-UserConfiguration {
     $childDomain = "$childPrefix.$parentDomain"
     Write-Host "  Child Domain FQDN: $childDomain" -ForegroundColor Green
     
-    $childNetBIOS = Read-Host "  Child NetBIOS Name [CORP]"
-    if ([string]::IsNullOrWhiteSpace($childNetBIOS)) { $childNetBIOS = "CORP" }
+    # Derive NetBIOS from prefix (not hardcoded CORP)
+    $childNetBIOSDefault = $childPrefix.ToUpper()
+    if ($childNetBIOSDefault.Length -gt 15) { $childNetBIOSDefault = $childNetBIOSDefault.Substring(0,15) }
+    
+    $childNetBIOS = Read-Host "  Child NetBIOS Name [$childNetBIOSDefault]"
+    if ([string]::IsNullOrWhiteSpace($childNetBIOS)) { $childNetBIOS = $childNetBIOSDefault }
     $childNetBIOS = $childNetBIOS.ToUpper()
+    if ($childNetBIOS.Length -gt 15) { 
+        $childNetBIOS = $childNetBIOS.Substring(0,15)
+        Write-Host "  NetBIOS truncated to 15 chars: $childNetBIOS" -ForegroundColor Yellow
+    }
     
     # VM Configuration
     Write-Host ""
     Write-Host "── VM Configuration ──" -ForegroundColor Yellow
     
+    # IMPORTANT: VM hostname must differ from domain NetBIOS name to avoid registration conflict
     $vmNameDefault = "$childPrefix-dc01"
-    $vmName = Read-Host "  VM Name [$vmNameDefault]"
-    if ([string]::IsNullOrWhiteSpace($vmName)) { $vmName = $vmNameDefault }
+    
+    $validVMName = $false
+    while (-not $validVMName) {
+        $vmName = Read-Host "  VM Name [$vmNameDefault]"
+        if ([string]::IsNullOrWhiteSpace($vmName)) { $vmName = $vmNameDefault }
+        
+        # Check if VM name matches NetBIOS (case-insensitive) - this causes dcpromo failure
+        if ($vmName.ToUpper() -eq $childNetBIOS) {
+            Write-Host "  ERROR: VM hostname cannot be the same as domain NetBIOS name ($childNetBIOS)" -ForegroundColor Red
+            Write-Host "         The VM registers its hostname on the network, which conflicts with dcpromo." -ForegroundColor Red
+            Write-Host "         Please use a different name like '$childPrefix-dc01' or '${childPrefix}dc'" -ForegroundColor Yellow
+        } else {
+            $validVMName = $true
+        }
+    }
     
     Write-Host ""
     Write-Host "  Recommended minimums: 4GB RAM, 2 vCPUs, 40GB disk" -ForegroundColor DarkGray
@@ -938,8 +960,17 @@ function Install-ChildDomainController {
         $primaryZone = Get-DnsServerZone -Name $ChildDomain -ErrorAction SilentlyContinue
         if (-not $primaryZone) {
             Write-Host "  WARNING: Primary DNS zone missing - creating..." -ForegroundColor Yellow
-            Add-DnsServerPrimaryZone -Name $ChildDomain -ReplicationScope Domain -DynamicUpdate Secure -ErrorAction Stop
-            Write-Host "  Created primary zone: $ChildDomain" -ForegroundColor Green
+            try {
+                Add-DnsServerPrimaryZone -Name $ChildDomain -ReplicationScope Domain -DynamicUpdate Secure -ErrorAction Stop
+                Write-Host "  Created primary zone: $ChildDomain" -ForegroundColor Green
+            } catch {
+                # Zone might already exist (created by dcpromo) or be delegated
+                if ($_.Exception.Message -match "9901|already exists") {
+                    Write-Host "  Zone already exists (created during promotion)" -ForegroundColor Green
+                } else {
+                    Write-Host "  Note: $($_.Exception.Message)" -ForegroundColor Yellow
+                }
+            }
         } else {
             Write-Host "  Primary zone exists: $ChildDomain" -ForegroundColor Green
         }
