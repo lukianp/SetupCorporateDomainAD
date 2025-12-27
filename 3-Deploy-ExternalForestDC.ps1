@@ -833,8 +833,16 @@ function Install-ExternalForestDC {
         $primaryZone = Get-DnsServerZone -Name $DomainName -ErrorAction SilentlyContinue
         if (-not $primaryZone) {
             Write-Host "  WARNING: Primary DNS zone missing - creating..." -ForegroundColor Yellow
-            Add-DnsServerPrimaryZone -Name $DomainName -ReplicationScope Domain -DynamicUpdate Secure -ErrorAction Stop
-            Write-Host "  Created primary zone: $DomainName" -ForegroundColor Green
+            try {
+                Add-DnsServerPrimaryZone -Name $DomainName -ReplicationScope Domain -DynamicUpdate Secure -ErrorAction Stop
+                Write-Host "  Created primary zone: $DomainName" -ForegroundColor Green
+            } catch {
+                if ($_.Exception.Message -match "9901|already exists") {
+                    Write-Host "  Zone already exists (created during promotion)" -ForegroundColor Green
+                } else {
+                    Write-Host "  Note: $($_.Exception.Message)" -ForegroundColor Yellow
+                }
+            }
         } else {
             Write-Host "  Primary zone exists: $DomainName" -ForegroundColor Green
         }
@@ -844,8 +852,16 @@ function Install-ExternalForestDC {
         $msdcsExists = Get-DnsServerZone -Name $msdcsZone -ErrorAction SilentlyContinue
         if (-not $msdcsExists) {
             Write-Host "  WARNING: _msdcs zone missing - creating..." -ForegroundColor Yellow
-            Add-DnsServerPrimaryZone -Name $msdcsZone -ReplicationScope Forest -DynamicUpdate Secure -ErrorAction Stop
-            Write-Host "  Created _msdcs zone: $msdcsZone" -ForegroundColor Green
+            try {
+                Add-DnsServerPrimaryZone -Name $msdcsZone -ReplicationScope Forest -DynamicUpdate Secure -ErrorAction Stop
+                Write-Host "  Created _msdcs zone: $msdcsZone" -ForegroundColor Green
+            } catch {
+                if ($_.Exception.Message -match "9901|already exists") {
+                    Write-Host "  _msdcs zone already exists (created during promotion)" -ForegroundColor Green
+                } else {
+                    Write-Host "  Note: $($_.Exception.Message)" -ForegroundColor Yellow
+                }
+            }
         } else {
             Write-Host "  _msdcs zone exists: $msdcsZone" -ForegroundColor Green
         }
@@ -946,7 +962,7 @@ function Install-ForestTrust {
     $externalCred = New-Object PSCredential("$($Config.ExternalNetBIOS)\Administrator", $securePassword)
     
     $primarySecurePassword = ConvertTo-SecureString $Config.PrimaryAdminPassword -AsPlainText -Force
-    $primaryCred = New-Object PSCredential("$($Config.PrimaryNetBIOS)\Administrator", $primarySecurePassword)
+    $primaryCred = New-Object PSCredential("Administrator@$($Config.PrimaryDomain)", $primarySecurePassword)
     
     # First, configure DNS on primary DC to resolve external forest
     # Using Invoke-Command -VMName for direct Hyper-V connection (avoids WinRM issues)
@@ -987,23 +1003,23 @@ function Install-ForestTrust {
     # Create the trust from external forest side
     Write-Log "Creating trust from external forest..."
     $trustCreated = Invoke-Command -VMName $Config.VMName -Credential $externalCred -ScriptBlock {
-        param($PrimaryDomain, $PrimaryNetBIOS, $PrimaryAdminUser, $PrimaryAdminPwd, $PrimaryDCIP)
+        param($PrimaryDomain, $PrimaryAdminPwd, $PrimaryDCIP)
         
         Import-Module ActiveDirectory
         
         try {
-            # Create credential for primary forest
+            # Create credential for primary forest using UPN format
             $secPwd = ConvertTo-SecureString $PrimaryAdminPwd -AsPlainText -Force
-            $primaryCred = New-Object PSCredential("$PrimaryNetBIOS\Administrator", $secPwd)
+            $primaryCred = New-Object PSCredential("Administrator@$PrimaryDomain", $secPwd)
             
             # Get the local forest
             $localForest = [System.DirectoryServices.ActiveDirectory.Forest]::GetCurrentForest()
             
-            # Get the remote forest context
+            # Get the remote forest context using UPN format
             $remoteContext = New-Object System.DirectoryServices.ActiveDirectory.DirectoryContext(
                 [System.DirectoryServices.ActiveDirectory.DirectoryContextType]::Forest,
                 $PrimaryDomain,
-                "$PrimaryNetBIOS\Administrator",
+                "Administrator@$PrimaryDomain",
                 $PrimaryAdminPwd
             )
             
@@ -1021,9 +1037,9 @@ function Install-ForestTrust {
         catch {
             Write-Warning "Trust creation via .NET failed: $_"
             
-            # Fallback: try netdom
+            # Fallback: try netdom with UPN format
             try {
-                $result = & netdom trust $env:USERDNSDOMAIN /Domain:$PrimaryDomain /Add /TwoWay /UserD:"$PrimaryNetBIOS\Administrator" /PasswordD:$PrimaryAdminPwd /UserO:"Administrator" /PasswordO:$PrimaryAdminPwd 2>&1
+                $result = & netdom trust $env:USERDNSDOMAIN /Domain:$PrimaryDomain /Add /TwoWay /UserD:"Administrator@$PrimaryDomain" /PasswordD:$PrimaryAdminPwd /UserO:"Administrator" /PasswordO:$PrimaryAdminPwd 2>&1
                 if ($LASTEXITCODE -eq 0) {
                     Write-Host "  Trust created via netdom" -ForegroundColor Green
                     return @{ Success = $true; Method = "netdom" }
@@ -1035,7 +1051,7 @@ function Install-ForestTrust {
                 return @{ Success = $false; Error = $_.Exception.Message }
             }
         }
-    } -ArgumentList $Config.PrimaryDomain, $Config.PrimaryNetBIOS, "$($Config.PrimaryNetBIOS)\Administrator", $Config.PrimaryAdminPassword, $Config.PrimaryDCIP
+    } -ArgumentList $Config.PrimaryDomain, $Config.PrimaryAdminPassword, $Config.PrimaryDCIP
     
     if ($trustCreated.Success) {
         Write-Log "Forest trust created successfully" -Level Success
