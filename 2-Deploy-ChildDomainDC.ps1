@@ -811,7 +811,7 @@ function Install-ChildDomainController {
             -Force `
             -WarningAction SilentlyContinue | Out-Null
             
-    } -ArgumentList $Config.ChildDomain, $Config.ParentDomain, $Config.ChildNetBIOS, $secureSafeMode, "$($Config.ParentNetBIOS)\Administrator", $Config.ParentAdminPassword
+    } -ArgumentList $Config.ChildDomain, $Config.ParentDomain, $Config.ChildNetBIOS, $secureSafeMode, "Administrator@$($Config.ParentDomain)", $Config.ParentAdminPassword
     
     Write-Log "Restarting VM..."
     Restart-VM -Name $Config.VMName -Force
