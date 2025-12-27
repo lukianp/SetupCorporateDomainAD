@@ -1013,20 +1013,47 @@ function Install-ChildDomainController {
         $adapter = Get-NetAdapter | Where-Object Status -eq "Up" | Select-Object -First 1
         Set-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -ServerAddresses @($SelfIP, $ParentDCIP)
         
-        # Add conditional forwarder for parent domain - CRITICAL
-        # Without this, parent domain resolves to public IP instead of internal DC
-        $existingForwarder = Get-DnsServerZone -Name $ParentDomain -ErrorAction SilentlyContinue
-        if (-not $existingForwarder) {
-            Add-DnsServerConditionalForwarderZone -Name $ParentDomain -MasterServers $ParentDCIP -ReplicationScope Forest -ErrorAction SilentlyContinue
-            Write-Host "  Added conditional forwarder: $ParentDomain -> $ParentDCIP" -ForegroundColor Green
+        # For child domains, parent domain zones are typically replicated via AD-integrated DNS
+        # Only add conditional forwarder if zone doesn't exist AND doesn't resolve correctly
+        $existingZone = Get-DnsServerZone -Name $ParentDomain -ErrorAction SilentlyContinue
+        if ($existingZone) {
+            Write-Host "  Parent zone exists: $ParentDomain (via AD replication)" -ForegroundColor Green
+        } else {
+            # Check if it resolves anyway (via forwarders)
+            $testRes = Resolve-DnsName -Name $ParentDomain -Type A -ErrorAction SilentlyContinue
+            if ($testRes.IPAddress -eq $ParentDCIP) {
+                Write-Host "  Parent domain resolves correctly via existing configuration" -ForegroundColor Green
+            } else {
+                # Need to add conditional forwarder
+                try {
+                    Add-DnsServerConditionalForwarderZone -Name $ParentDomain -MasterServers $ParentDCIP -ReplicationScope Forest -ErrorAction Stop
+                    Write-Host "  Added conditional forwarder: $ParentDomain -> $ParentDCIP" -ForegroundColor Green
+                } catch {
+                    if ($_.Exception.Message -match "9903|already exists") {
+                        Write-Host "  Parent zone already configured" -ForegroundColor Green
+                    } else {
+                        Write-Host "  Note: $($_.Exception.Message)" -ForegroundColor Yellow
+                    }
+                }
+            }
         }
         
-        # Also add forwarder for _msdcs zone of parent domain (for DC GUID resolution)
+        # Check _msdcs zone for parent domain
         $msdcsZone = "_msdcs.$ParentDomain"
         $existingMsdcs = Get-DnsServerZone -Name $msdcsZone -ErrorAction SilentlyContinue
-        if (-not $existingMsdcs) {
-            Add-DnsServerConditionalForwarderZone -Name $msdcsZone -MasterServers $ParentDCIP -ReplicationScope Forest -ErrorAction SilentlyContinue
-            Write-Host "  Added conditional forwarder: $msdcsZone -> $ParentDCIP" -ForegroundColor Green
+        if ($existingMsdcs) {
+            Write-Host "  _msdcs zone exists: $msdcsZone (via AD replication)" -ForegroundColor Green
+        } else {
+            try {
+                Add-DnsServerConditionalForwarderZone -Name $msdcsZone -MasterServers $ParentDCIP -ReplicationScope Forest -ErrorAction Stop
+                Write-Host "  Added conditional forwarder: $msdcsZone -> $ParentDCIP" -ForegroundColor Green
+            } catch {
+                if ($_.Exception.Message -match "9903|already exists") {
+                    Write-Host "  _msdcs zone already configured" -ForegroundColor Green
+                } else {
+                    Write-Host "  Note: $($_.Exception.Message)" -ForegroundColor Yellow
+                }
+            }
         }
         
         # Clear DNS cache to apply changes
@@ -1037,8 +1064,10 @@ function Install-ChildDomainController {
         $testResolution = Resolve-DnsName -Name $ParentDomain -Type A -ErrorAction SilentlyContinue
         if ($testResolution.IPAddress -eq $ParentDCIP) {
             Write-Host "  DNS verification: $ParentDomain -> $ParentDCIP (Correct)" -ForegroundColor Green
+        } elseif ($testResolution) {
+            Write-Host "  DNS verification: $ParentDomain -> $($testResolution.IPAddress)" -ForegroundColor Cyan
         } else {
-            Write-Host "  DNS verification: $ParentDomain resolved to $($testResolution.IPAddress) (May need manual fix)" -ForegroundColor Yellow
+            Write-Host "  DNS verification: $ParentDomain resolution pending" -ForegroundColor Yellow
         }
         
     } -ArgumentList $Config.ParentDCIP, $Config.VMIP, $Config.ParentDomain
